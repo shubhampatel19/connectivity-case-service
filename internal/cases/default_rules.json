@@ -1,0 +1,25 @@
+{
+  "rules": [
+    {
+      "id": "thermal-critical",
+      "code": "thermal.critical",
+      "title": "CPU over its thermal fault threshold",
+      "severity": "critical",
+      "storm": { "devices": 5, "window": "10m" }
+    },
+    {
+      "id": "psu-rail-unstable",
+      "code": "power.rail_out_of_range",
+      "title": "PSU 12V rail repeatedly out of range",
+      "severity": "major",
+      "threshold": { "count": 3, "window": "15m" }
+    },
+    {
+      "id": "disk-reallocating",
+      "code": "storage.reallocated_sectors",
+      "title": "Disk reallocating sectors",
+      "severity": "minor",
+      "min_value": 5
+    }
+  ]
+}

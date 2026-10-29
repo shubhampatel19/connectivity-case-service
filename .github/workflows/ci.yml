@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Deduplication lives in SQL (primary keys, a partial unique index, an
+    # advisory lock), so the tests that matter run against real Postgres.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cases
+          POSTGRES_PASSWORD: cases
+          POSTGRES_DB: cases_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U cases -d cases_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      CASES_TEST_DATABASE_URL: postgres://cases:cases@localhost:5432/cases_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          [ -z "$(git status --porcelain -- go.mod go.sum)" ] || { git diff -- go.mod go.sum; echo "::error::go.mod or go.sum is not tidy: run go mod tidy and commit the result"; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Test against Postgres
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./... 2>&1 | tee /tmp/test.log | grep -E '^(--- |ok|FAIL|panic)'
+          # A misconfigured database URL would skip the integration tests and
+          # still pass. Skipped tests fail the build here.
+          if grep -q -- '--- SKIP' /tmp/test.log; then
+            echo "::error::integration tests were skipped: $(grep -- '--- SKIP' /tmp/test.log | tr '\n' ' ')"
+            exit 1
+          fi
+      - name: Report failures
+        if: failure()
+        run: |
+          enc() { sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g'; }
+          [ -f /tmp/test.log ] && echo "::error title=go test::$(grep -E -B2 -A12 -- '--- FAIL|panic:' /tmp/test.log | head -60 | enc)"
+          true
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: docker build -t case-service:ci .
