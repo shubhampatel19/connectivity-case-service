@@ -6,7 +6,11 @@ import (
 	"errors"
 	"fmt"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/shubhampatel19/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 type Outcome string
@@ -45,7 +49,14 @@ type Result struct {
 //  5. If enough devices at the site have raised the code, open a site case
 //     and make the site's open device cases for the rule its children.
 //  6. Otherwise open a device case.
-func (s *Store) ProcessAlert(ctx context.Context, env wire.AlertEnvelope, rules *Rules) (Result, error) {
+func (s *Store) ProcessAlert(ctx context.Context, env wire.AlertEnvelope, rules *Rules) (_ Result, err error) {
+	ctx, span := platform.Tracer().Start(ctx, "postgres decide alert",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("db.system", "postgresql")))
+	defer func() {
+		platform.RecordError(ctx, err)
+		span.End()
+	}()
 	a := env.Alert
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

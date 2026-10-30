@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 // caseStore is what the API needs from the database; tests can fake it.
@@ -35,12 +37,15 @@ func NewAPI(st caseStore, rules *Rules, log *slog.Logger, m *Metrics) *API {
 // Handler wires the routes. metricsHandler may be nil (tests).
 func (a *API) Handler(metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("GET /v1/cases", a.route("list", a.list))
-	mux.Handle("GET /v1/cases/{id}", a.route("get", a.get))
-	mux.Handle("POST /v1/cases/{id}/resolve", a.route("resolve", a.resolve))
-	mux.Handle("GET /v1/rules", a.route("rules", func(w http.ResponseWriter, _ *http.Request) {
+	route := func(pattern, name string, h http.HandlerFunc) {
+		mux.Handle(pattern, platform.TraceHTTP(pattern, a.route(name, h)))
+	}
+	route("GET /v1/cases", "list", a.list)
+	route("GET /v1/cases/{id}", "get", a.get)
+	route("POST /v1/cases/{id}/resolve", "resolve", a.resolve)
+	route("GET /v1/rules", "rules", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"rules": a.rules.List()})
-	}))
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -141,7 +146,7 @@ func (a *API) resolve(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, "resolve case", err)
 	default:
 		a.m.casesResolved.Inc()
-		a.log.Info("case resolved", "case_id", id, "children", children, "resolution", body.Resolution)
+		a.log.InfoContext(r.Context(), "case resolved", "case_id", id, "children", children, "resolution", body.Resolution)
 		writeJSON(w, http.StatusOK, map[string]any{"case_id": id, "status": "resolved", "children_resolved": children})
 	}
 }

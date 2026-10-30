@@ -63,6 +63,10 @@ No authentication: it's an internal API for the support team, reachable only ins
 
 A new consumer group starts from the beginning of the topics, so a case service deployed after devices began alerting still sees every alert. That also makes a full replay a safe drill: reset the group's offsets and no new cases should appear.
 
+## Tracing
+
+An alert's trace runs from the device, through the gateway and the ingest API, to the decision here: each record gets a consumer span continuing the trace from its Kafka headers, with the decision transaction as a child. The span records the alert, its `outcome` (`opened`, `attached`, `duplicate`, ...) and, when there is one, the case ID and rule, so you can find the trace for a case's first alert by searching Tempo for `case.id`. The API's routes get server spans too.
+
 ## Configuration
 
 | Variable | Default |

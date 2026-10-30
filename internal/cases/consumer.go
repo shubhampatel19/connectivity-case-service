@@ -9,8 +9,11 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/shubhampatel19/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 // errPoison marks a record that can never succeed (bad JSON, an invalid
@@ -107,7 +110,26 @@ func (c *Consumer) Run(ctx context.Context) error {
 // handleWithRetry retries transient failures in place with capped backoff.
 // Blocking the partition is deliberate: skipping ahead would reorder a
 // device's alerts, and thresholds count them. Consumer lag shows it happening.
-func (c *Consumer) handleWithRetry(ctx context.Context, rec *kgo.Record) error {
+//
+// Each record gets one consumer span that continues the device's trace from
+// the record headers: the alert's trace runs from the device, through the
+// gateway and the ingest API, to the case decision.
+func (c *Consumer) handleWithRetry(ctx context.Context, rec *kgo.Record) (err error) {
+	spanCtx, span := platform.Tracer().Start(platform.ContextFromHeaders(ctx, recordHeaders(rec)), "process "+rec.Topic,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination.name", rec.Topic),
+			attribute.String("messaging.consumer.group.name", c.cfg.Group),
+			attribute.Int("messaging.destination.partition.id", int(rec.Partition)),
+			attribute.Int64("messaging.kafka.offset", rec.Offset),
+		))
+	defer func() {
+		platform.RecordError(spanCtx, err)
+		span.End()
+	}()
+	ctx = spanCtx
+
 	backoff := 200 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		start := time.Now()
@@ -117,14 +139,17 @@ func (c *Consumer) handleWithRetry(ctx context.Context, rec *kgo.Record) error {
 			return nil
 		}
 		if errors.Is(err, errPoison) {
-			c.log.Error("skipping unprocessable record", "topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset, "err", err)
+			span.SetAttributes(attribute.String("outcome", "poison"))
+			platform.RecordError(ctx, err)
+			c.log.ErrorContext(ctx, "skipping unprocessable record", "topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset, "err", err)
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		c.m.retries.WithLabelValues(rec.Topic).Inc()
-		c.log.Warn("record failed, retrying", "topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset,
+		span.AddEvent("retry", trace.WithAttributes(attribute.Int("attempt", attempt), attribute.String("error", err.Error())))
+		c.log.WarnContext(ctx, "record failed, retrying", "topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset,
 			"attempt", attempt, "retry_in", backoff, "err", err)
 		select {
 		case <-ctx.Done():
@@ -149,9 +174,20 @@ func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
 			c.m.alertsRejected.WithLabelValues("invalid").Inc()
 			return fmt.Errorf("%w: invalid alert %q: %v", errPoison, env.Alert.AlertID, err)
 		}
+		span := trace.SpanFromContext(ctx)
+		span.SetAttributes(
+			attribute.String("alert.id", env.Alert.AlertID),
+			attribute.String("alert.code", string(env.Alert.Code)),
+			attribute.String("device.id", env.Alert.DeviceID),
+			attribute.String("site.id", env.Alert.SiteID),
+		)
 		res, err := c.store.ProcessAlert(ctx, env, c.rules)
 		if err != nil {
 			return err
+		}
+		span.SetAttributes(attribute.String("outcome", string(res.Outcome)))
+		if res.CaseID != 0 {
+			span.SetAttributes(attribute.Int64("case.id", res.CaseID), attribute.String("case.rule", res.RuleID), attribute.String("case.scope", res.Scope))
 		}
 		c.m.alerts.WithLabelValues(string(res.Outcome)).Inc()
 		if res.Outcome == OutcomeDuplicate {
@@ -161,7 +197,7 @@ func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
 		if res.Outcome == OutcomeOpened {
 			c.m.casesOpened.WithLabelValues(res.RuleID, res.Scope).Inc()
 			c.m.adopted.Add(float64(res.Adopted))
-			c.log.Info("case opened", "case_id", res.CaseID, "rule", res.RuleID, "scope", res.Scope,
+			c.log.InfoContext(ctx, "case opened", "case_id", res.CaseID, "rule", res.RuleID, "scope", res.Scope,
 				"device_id", env.Alert.DeviceID, "site_id", env.Alert.SiteID, "alert_id", env.Alert.AlertID, "adopted", res.Adopted)
 		}
 		return nil
@@ -174,6 +210,7 @@ func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
 		if ev.BundleID == "" || ev.DeviceID == "" || ev.ObjectKey == "" {
 			return fmt.Errorf("%w: bundle event missing bundle id, device id or object key", errPoison)
 		}
+		trace.SpanFromContext(ctx).SetAttributes(attribute.String("device.id", ev.DeviceID), attribute.String("bundle.id", ev.BundleID))
 		dup, err := c.store.SaveBundle(ctx, ev)
 		if err != nil {
 			return err
@@ -182,6 +219,7 @@ func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
 		if dup {
 			result = "duplicate"
 		}
+		trace.SpanFromContext(ctx).SetAttributes(attribute.String("outcome", result))
 		c.m.bundles.WithLabelValues(result).Inc()
 		return nil
 
@@ -219,4 +257,14 @@ func RefreshStats(ctx context.Context, st *Store, every time.Duration, log *slog
 		case <-t.C:
 		}
 	}
+}
+
+// recordHeaders turns Kafka record headers into the map the trace
+// propagator reads.
+func recordHeaders(rec *kgo.Record) map[string]string {
+	m := make(map[string]string, len(rec.Headers))
+	for _, h := range rec.Headers {
+		m[h.Key] = string(h.Value)
+	}
+	return m
 }

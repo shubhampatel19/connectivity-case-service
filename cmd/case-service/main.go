@@ -48,6 +48,18 @@ func run(log *slog.Logger) error {
 			"min_value", r.MinValue, "threshold", r.Threshold, "storm", r.Storm)
 	}
 
+	tracingCtx, cancelTracing := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownTracing, err := platform.InitTracing(tracingCtx, "case-service", log)
+	cancelTracing()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(ctx)
+	}()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
